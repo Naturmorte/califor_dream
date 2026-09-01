@@ -2,12 +2,37 @@
 for these datasets (confirmed via live requests, 2026-09-01)."""
 
 import json
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Iterator, Optional
 
 PAGE_SIZE = 1000
 TIMEOUT_SECONDS = 30
+MAX_RETRIES = 4
+BACKOFF_BASE_SECONDS = 1.0
+
+
+def _fetch_page(url: str) -> list:
+    """GET with retry+backoff on transient errors (5xx, timeouts). Client
+    errors (4xx - a bad query) are not retried, they'd just fail the same
+    way again. Surfaces the real error after MAX_RETRIES, doesn't swallow it -
+    a caller mid-pagination will have already committed prior rows, and
+    idempotency (content_hash) makes a plain rerun safe (see docs/01)."""
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            last_error = e
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = e
+        time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+    raise last_error
 
 
 def fetch_records(
@@ -31,8 +56,7 @@ def fetch_records(
         if where:
             params["$where"] = where
         url = f"https://{domain}/resource/{dataset_id}.json?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as resp:
-            page = json.loads(resp.read().decode("utf-8"))
+        page = _fetch_page(url)
         if not page:
             return
         for row in page:
@@ -50,6 +74,5 @@ def fetch_count(domain: str, dataset_id: str, where: Optional[str] = None) -> in
     if where:
         params["$where"] = where
     url = f"https://{domain}/resource/{dataset_id}.json?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as resp:
-        page = json.loads(resp.read().decode("utf-8"))
+    page = _fetch_page(url)
     return int(page[0]["count"]) if page else 0
